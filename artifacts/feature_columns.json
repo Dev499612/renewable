@@ -1,0 +1,19 @@
+[
+  "wind",
+  "solar",
+  "biomass",
+  "hydro",
+  "air_temp",
+  "albedo",
+  "clearsky_dhi",
+  "clearsky_dni",
+  "clearsky_gti",
+  "cloud_opacity",
+  "dni",
+  "ghi",
+  "gti",
+  "precipitation_rate",
+  "relative_humidity",
+  "surface_pressure",
+  "wind_speed_100m"
+]
