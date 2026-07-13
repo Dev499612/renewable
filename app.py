@@ -19,6 +19,7 @@ Run:
     streamlit run app.py
 """
  
+import os
 import json
 import pandas as pd
 import streamlit as st
@@ -31,7 +32,7 @@ from cluster_insights import (
     build_all_cluster_insights, RESOURCE_COLUMNS, resource_specific_note, z_to_suitability_score,
 )
  
-ARTIFACTS_DIR = "artifacts"
+MODELS_DIR = "models"
 WEATHER_MAP = {
     "Temperature (°C)": ("air_temp", "🌡️"),
     "Humidity (%)": ("relative_humidity", "💧"),
@@ -84,123 +85,131 @@ def kpi_card(label, value, sub=None):
             {sub_html}
         </div>
     """, unsafe_allow_html=True)
- 
- 
- 
+
+
 # --------------------------------------------------------------------------
-# LOAD ARTIFACTS (cached so the model/data only loads once per session)
+# LOAD ARTIFACTS (cached so the models only load once per session)
 # --------------------------------------------------------------------------
 @st.cache_resource
 def load_artifacts():
-    scaler = joblib.load(f"{ARTIFACTS_DIR}/standard_scaler.joblib")
-    kmeans = joblib.load(f"{ARTIFACTS_DIR}/kmeans_model.joblib")
-    pca_viz = joblib.load(f"{ARTIFACTS_DIR}/pca_viz.joblib")
- 
-    with open(f"{ARTIFACTS_DIR}/feature_columns.json") as f:
-        feature_cols = json.load(f)
-    with open(f"{ARTIFACTS_DIR}/meta.json") as f:
-        meta = json.load(f)
- 
-    cluster_profiles = pd.read_csv(f"{ARTIFACTS_DIR}/cluster_profiles.csv", index_col="cluster")
-    centroids_scaled = pd.read_csv(f"{ARTIFACTS_DIR}/cluster_centroids_scaled.csv", index_col="cluster")
-    clustered_data = pd.read_csv(f"{ARTIFACTS_DIR}/clustered_dataset.csv")
- 
-    insights = build_all_cluster_insights(centroids_scaled)
- 
-    # Pre-compute a 2D PCA projection of every record, for the scatter plot
-    X_scaled_all = scaler.transform(clustered_data[feature_cols])
-    pca_coords = pca_viz.transform(X_scaled_all)
-    clustered_data = clustered_data.copy()
-    clustered_data["pc1"] = pca_coords[:, 0]
-    clustered_data["pc2"] = pca_coords[:, 1]
- 
+    models = {}
+    for r in ["solar", "wind", "hydro", "biomass"]:
+        r_dir = os.path.join(MODELS_DIR, r)
+        with open(os.path.join(r_dir, "metadata.json")) as f:
+            meta = json.load(f)
+        scaler = joblib.load(os.path.join(r_dir, "scaler.joblib"))
+        kmeans = joblib.load(os.path.join(r_dir, "kmeans.joblib"))
+        pca = None
+        if meta["use_pca"]:
+            pca = joblib.load(os.path.join(r_dir, "pca.joblib"))
+            
+        # Visual PCA for 2D scatter plot
+        pca_viz = joblib.load(os.path.join(r_dir, "pca_viz.joblib")) if os.path.exists(os.path.join(r_dir, "pca_viz.joblib")) else None
+        
+        cluster_profiles = pd.read_csv(os.path.join(r_dir, "cluster_profile.csv"), index_col="cluster")
+        centroids_scaled = pd.read_csv(os.path.join(r_dir, "cluster_centroids_scaled.csv"), index_col="cluster")
+        
+        # Build insights lookup for this model
+        insights = build_all_cluster_insights(centroids_scaled, r.capitalize(), meta["feature_cols"])
+        
+        models[r.capitalize()] = {
+            "scaler": scaler,
+            "kmeans": kmeans,
+            "pca": pca,
+            "pca_viz": pca_viz,
+            "feature_cols": meta["feature_cols"],
+            "use_pca": meta["use_pca"],
+            "cluster_profiles": cluster_profiles,
+            "centroids_scaled": centroids_scaled,
+            "insights": insights,
+            "best_k": meta["best_k"],
+        }
+        
+    clustered_data = pd.read_csv(os.path.join(MODELS_DIR, "clustered_dataset.csv"))
+    
+    # Pre-compute visual PCA components for every state/month record to speed up dashboard rendering
+    for r in ["Solar", "Wind", "Hydro", "Biomass"]:
+        m = models[r]
+        if m["pca_viz"] is not None:
+            X_scaled_all = m["scaler"].transform(clustered_data[m["feature_cols"]])
+            pca_coords = m["pca_viz"].transform(X_scaled_all)
+            clustered_data[f"{r.lower()}_pc1"] = pca_coords[:, 0]
+            clustered_data[f"{r.lower()}_pc2"] = pca_coords[:, 1]
+            
     return {
-        "scaler": scaler,
-        "kmeans": kmeans,
-        "pca_viz": pca_viz,
-        "feature_cols": feature_cols,
-        "meta": meta,
-        "cluster_profiles": cluster_profiles,
-        "centroids_scaled": centroids_scaled,
+        "models": models,
         "clustered_data": clustered_data,
-        "insights": insights,
     }
- 
- 
+
+
 @st.cache_data
-def build_state_map_data(clustered_data: pd.DataFrame, feature_cols: list) -> pd.DataFrame:
+def build_state_map_data(clustered_data: pd.DataFrame, feature_cols: list, cluster_col: str) -> pd.DataFrame:
     """One row per state -- averaged across all months/years -- used for the
     geographic map. Cached since it only depends on the (static) trained
-    dataset, not on any sidebar selection."""
+    dataset."""
     agg = {**{c: "mean" for c in feature_cols}, "latitude": "mean", "longitude": "mean",
-           "cluster": lambda x: x.mode().iloc[0]}
+           cluster_col: lambda x: x.mode().iloc[0]}
     state_avg = clustered_data.groupby("state_ut").agg(agg).reset_index()
+    state_avg = state_avg.rename(columns={cluster_col: "cluster"})
     return state_avg
- 
- 
-def predict_cluster(scaler, kmeans, feature_cols, feature_values):
-    """Runs the TRAINED scaler + TRAINED KMeans model on a feature vector.
-    Kept as a single function so this exact pipeline step is easy to spot
-    and never gets duplicated or drift from itself elsewhere in the file."""
+
+
+def predict_cluster(scaler, kmeans, pca, feature_cols, feature_values):
+    """Runs the TRAINED scaler + optional PCA + TRAINED KMeans model on a feature vector."""
     features_df = pd.DataFrame([feature_values.values], columns=feature_cols)
     scaled = scaler.transform(features_df)
+    if pca is not None:
+        scaled = pca.transform(scaled)
     cluster_id = int(kmeans.predict(scaled)[0])
     return cluster_id, scaled
- 
- 
+
+
 @st.cache_data
-def build_state_rankings(_scaler, feature_cols, clustered_data):
+def build_state_rankings(_models, clustered_data):
     """Compute a fully data-driven ranking of every state by each renewable
-    resource potential. Uses the trained scaler's standardization (already fit
-    on the entire dataset) to compute z-scores, then converts to 0-100
-    suitability scores via the standard normal CDF (z_to_suitability_score).
+    resource potential. Uses each resource's own features and scaler."""
+    state_avg = clustered_data.groupby("state_ut").mean(numeric_only=True).reset_index()
+    rankings = {"state_ut": state_avg["state_ut"].values}
     
-    No hardcoded weights, no manual thresholds -- every number is derived
-    from the model's own trained statistics. If the model is retrained on
-    new data, these rankings update automatically."""
-    # Average all months/years per state to get the overall profile
-    feature_df = clustered_data.groupby("state_ut")[feature_cols].mean().reset_index()
-    
-    # Standardize using the trained scaler so scores reflect standing
-    # relative to the full dataset distribution (the same distribution
-    # the KMeans model was trained on).
-    scaled = _scaler.transform(feature_df[feature_cols])
-    
-    rankings = {"state_ut": feature_df["state_ut"].values}
-    for resource_name, resource_col in RESOURCE_COLUMNS.items():
+    for r in ["Solar", "Wind", "Hydro", "Biomass"]:
+        m = _models[r]
+        scaler = m["scaler"]
+        feature_cols = m["feature_cols"]
+        
+        state_feats = state_avg[feature_cols]
+        scaled = scaler.transform(state_feats)
+        
+        resource_col = RESOURCE_COLUMNS[r]
         feat_idx = feature_cols.index(resource_col)
+        
         z_scores = scaled[:, feat_idx]
         scores = [z_to_suitability_score(z) for z in z_scores]
-        rankings[resource_name] = scores
-        rankings[f"{resource_name} z"] = [round(z, 3) for z in z_scores]
-    
+        rankings[r] = scores
+        rankings[f"{r} z"] = [round(z, 3) for z in z_scores]
+        
     ranking_df = pd.DataFrame(rankings)
-    
-    # Add overall score (average across all four resources)
-    score_cols = list(RESOURCE_COLUMNS.keys())
+    score_cols = ["Solar", "Wind", "Hydro", "Biomass"]
     ranking_df["Overall"] = ranking_df[score_cols].mean(axis=1).round(1)
     
     return ranking_df
 
 
 @st.cache_data
-def compute_cluster_confidence(_scaler, _kmeans, feature_cols, clustered_data):
+def compute_cluster_confidence(_scaler, _kmeans, _pca, feature_cols, clustered_data):
     """For each state's year-round average profile, compute:
     - assigned_cluster: the K-Means label
     - confidence: a 0-1 score where 1 = very certain, 0 = borderline
       (based on the ratio of distance to nearest other centroid vs.
        distance to assigned centroid)
     - second_cluster: the next-best cluster
-    - second_cluster_name: human-readable name of that cluster
-    
-    States with confidence < 0.7 are considered 'bi-cluster' states
-    that sit on a boundary between two climate zones."""
+    """
     centroids = _kmeans.cluster_centers_
-    n_clusters = centroids.shape[0]
     
     feature_df = clustered_data.groupby("state_ut")[feature_cols].mean().reset_index()
     X = _scaler.transform(feature_df[feature_cols])
-    
+    if _pca is not None:
+        X = _pca.transform(X)
+        
     results_rows = []
     for i, row_vec in enumerate(X):
         # Euclidean distance to every centroid
@@ -214,16 +223,10 @@ def compute_cluster_confidence(_scaler, _kmeans, feature_cols, clustered_data):
         second_idx = np.argmin(dists_no_assigned)
         second_dist = dists_no_assigned[second_idx]
         
-        # Confidence: ratio of (distance to assigned) / (distance to second-best)
-        # If assigned is much closer → confidence near 1
-        # If they are equal → confidence near 0.5
-        # Range is 0.5 to 1.0, so we normalize: 2 * (1 - (closest / second))
-        # capped at 0 for the lower bound.
         if second_dist == 0:
-            conf = 1.0  # exact match, perfect confidence
+            conf = 1.0
         else:
             raw_ratio = closest_dist / second_dist
-            # Scale: ratio=0.5 -> 0.67, ratio=0.8 -> 0.44, ratio=1.0 -> 0.0
             conf = max(0.0, 1.0 - raw_ratio)
         
         results_rows.append({
@@ -234,34 +237,20 @@ def compute_cluster_confidence(_scaler, _kmeans, feature_cols, clustered_data):
         })
     
     return pd.DataFrame(results_rows)
- 
- 
+
+
 try:
     A = load_artifacts()
 except FileNotFoundError:
     st.error(
-        "Model artifacts not found in the `artifacts/` folder.\n\n"
-        "Run `python train_pipeline.py` first (with your raw dataset in "
-        "this folder) to generate the trained scaler, K-Means model and "
-        "cluster profiles that this dashboard depends on."
+        "Model artifacts not found in the `models/` folder.\n\n"
+        "Run `python train_pipeline.py` first to train the 4 independent "
+        "models and generate the required profiles."
     )
     st.stop()
- 
-CLUSTER_NAME_LOOKUP = A["insights"]["cluster_name"].to_dict()
- 
-# Pre-compute state rankings once (cached) -- same data used in the
-# State Rankings tab below. No need to recompute on every interaction.
-STATE_RANKINGS = build_state_rankings(A["scaler"], A["feature_cols"], A["clustered_data"])
 
-# Pre-compute cluster confidence for every state
-CLUSTER_CONFIDENCE = compute_cluster_confidence(
-    A["scaler"], A["kmeans"], A["feature_cols"], A["clustered_data"]
-)
-# Add readable cluster names
-CLUSTER_CONFIDENCE["assigned_name"] = CLUSTER_CONFIDENCE["assigned_cluster"].map(CLUSTER_NAME_LOOKUP)
-CLUSTER_CONFIDENCE["second_name"] = CLUSTER_CONFIDENCE["second_cluster"].map(CLUSTER_NAME_LOOKUP)
-# Flag bi-cluster states (confidence < 0.7)
-CLUSTER_CONFIDENCE["bi_cluster"] = CLUSTER_CONFIDENCE["confidence"] < 0.7
+# Pre-compute state rankings globally using the independent models
+STATE_RANKINGS = build_state_rankings(A["models"], A["clustered_data"])
  
  
 # --------------------------------------------------------------------------
@@ -270,12 +259,11 @@ CLUSTER_CONFIDENCE["bi_cluster"] = CLUSTER_CONFIDENCE["confidence"] < 0.7
 st.sidebar.title("🔧 Analysis Controls")
  
 resource_choice = st.sidebar.selectbox(
-    "Renewable Resource of Interest",
+    "Renewable Resource",
     options=list(RESOURCE_COLUMNS.keys()),
     help=(
-        "Highlights this resource in the charts/map and adds a note about it in "
-        "Overall Analysis. It does NOT change the predicted cluster -- that's based "
-        "on the location's full climate profile, not on which resource you're browsing for."
+        "Selects which of the four independent machine learning models to use for analysis. "
+        "Each model is trained specifically on its own features."
     ),
 )
  
@@ -312,9 +300,11 @@ if not st.session_state.analyzed:
     st.stop()
  
 # --------------------------------------------------------------------------
-# RUN THE TRAINED PIPELINE FOR THE SELECTED STATE
+# RUN THE SELECTED RESOURCE'S TRAINED PIPELINE FOR THE SELECTED STATE
 # --------------------------------------------------------------------------
-feature_cols = A["feature_cols"]
+current_model = A["models"][resource_choice]
+feature_cols = current_model["feature_cols"]
+
 # Average across all months/years for the selected state to get an overall picture
 state_data = A["clustered_data"][
     A["clustered_data"]["state_ut"] == state_choice
@@ -324,23 +314,48 @@ if state_data.empty:
     st.stop()
  
 location_features = state_data[feature_cols].mean()  # average across all months and years
-predicted_cluster, X_new_scaled = predict_cluster(A["scaler"], A["kmeans"], feature_cols, location_features)
-pc_coords_new = A["pca_viz"].transform(X_new_scaled)[0]
+predicted_cluster, X_new_scaled = predict_cluster(
+    current_model["scaler"], 
+    current_model["kmeans"], 
+    current_model["pca"], 
+    feature_cols, 
+    location_features
+)
+
+# Project to 2D for visualization
+if current_model["pca_viz"] is not None:
+    location_features_df = pd.DataFrame([location_features.values], columns=feature_cols)
+    scaled_feats = current_model["scaler"].transform(location_features_df)
+    pc_coords_new = current_model["pca_viz"].transform(scaled_feats)[0]
+else:
+    pc_coords_new = np.array([0.0, 0.0])
  
-cluster_name = A["insights"].loc[predicted_cluster, "cluster_name"]
-explanation = A["insights"].loc[predicted_cluster, "explanation"]
-recommendation = A["insights"].loc[predicted_cluster, "recommendation"]
-cluster_profile_row = A["cluster_profiles"].loc[predicted_cluster]
+cluster_name = current_model["insights"].loc[predicted_cluster, "cluster_name"]
+explanation = current_model["insights"].loc[predicted_cluster, "explanation"]
+recommendation = current_model["insights"].loc[predicted_cluster, "recommendation"]
+cluster_profile_row = current_model["cluster_profiles"].loc[predicted_cluster]
 cluster_color = CLUSTER_COLORS[predicted_cluster % len(CLUSTER_COLORS)]
 
-# This location's own precise z-score for the selected resource (not the
-# cluster-average version) -> converted into a 0-100 suitability score via
-# the standard normal CDF. See z_to_suitability_score() in cluster_insights.py
-# for why this involves no hardcoded weights or thresholds.
+# This location's own precise z-score for the selected resource
 resource_col = RESOURCE_COLUMNS[resource_choice]
 resource_feature_idx = feature_cols.index(resource_col)
-location_resource_z = X_new_scaled[0][resource_feature_idx]
+location_features_df = pd.DataFrame([location_features.values], columns=feature_cols)
+scaled_vector = current_model["scaler"].transform(location_features_df)[0]
+location_resource_z = scaled_vector[resource_feature_idx]
 suitability_score = z_to_suitability_score(location_resource_z)
+
+# Pre-compute cluster confidence dynamically for the active resource model
+CLUSTER_CONFIDENCE = compute_cluster_confidence(
+    current_model["scaler"],
+    current_model["kmeans"],
+    current_model["pca"],
+    feature_cols,
+    A["clustered_data"]
+)
+CLUSTER_NAME_LOOKUP = current_model["insights"]["cluster_name"].to_dict()
+CLUSTER_CONFIDENCE["assigned_name"] = CLUSTER_CONFIDENCE["assigned_cluster"].map(CLUSTER_NAME_LOOKUP)
+CLUSTER_CONFIDENCE["second_name"] = CLUSTER_CONFIDENCE["second_cluster"].map(CLUSTER_NAME_LOOKUP)
+CLUSTER_CONFIDENCE["bi_cluster"] = CLUSTER_CONFIDENCE["confidence"] < 0.7
 
 # Look up cluster confidence for the selected state
 state_conf_row = CLUSTER_CONFIDENCE[CLUSTER_CONFIDENCE["state_ut"] == state_choice].iloc[0]
@@ -386,8 +401,8 @@ with tab_overview:
     kpi_card("Cluster Confidence", conf_label, sub=conf_icon)
     
     st.success(f"**Recommendation:** {recommendation}")
-
-    resource_note = resource_specific_note(A["centroids_scaled"].loc[predicted_cluster], resource_choice)
+ 
+    resource_note = resource_specific_note(current_model["centroids_scaled"].loc[predicted_cluster], resource_choice)
     st.info(f"**About {resource_choice} here:** {resource_note}")
     
     # Bi-cluster alert if applicable
@@ -409,11 +424,12 @@ with tab_overview:
     st.subheader("🌤️ Weather Summary (Overall Year-Round Averages)")
     weather_cols = st.columns(len(WEATHER_MAP))
     for col_widget, (label, (feat, icon)) in zip(weather_cols, WEATHER_MAP.items()):
-        if feat in location_features.index:
-            col_widget.metric(f"{icon} {label}", f"{location_features[feat]:.2f}")
+        if feat in state_data.columns:
+            feat_avg = state_data[feat].mean()
+            col_widget.metric(f"{icon} {label}", f"{feat_avg:.2f}")
  
     st.subheader("⚡ Renewable Resource Comparison")
-    resource_rows = [{"Resource": name, "Potential": location_features[col]} for name, col in RESOURCE_COLUMNS.items()]
+    resource_rows = [{"Resource": name, "Potential": state_data[col].mean()} for name, col in RESOURCE_COLUMNS.items()]
     resource_df = pd.DataFrame(resource_rows)
     colors = ["#F5A623" if r == resource_choice else "#4A90D9" for r in resource_df["Resource"]]
     fig_resource = go.Figure(go.Bar(
@@ -449,7 +465,7 @@ with tab_map:
         "Your analyzed location is marked with a black star."
     )
  
-    state_map_df = build_state_map_data(A["clustered_data"], feature_cols)
+    state_map_df = build_state_map_data(A["clustered_data"], feature_cols, f"{resource_choice.lower()}_cluster")
     state_map_df["cluster_str"] = state_map_df["cluster"].astype(str)
     state_map_df["cluster_name"] = state_map_df["cluster"].map(CLUSTER_NAME_LOOKUP)
     resource_col = RESOURCE_COLUMNS[resource_choice]
@@ -511,8 +527,14 @@ with tab_map:
         st.success("No boundary states detected — all states have a clear dominant cluster.")
  
     st.subheader("PCA Projection (all individual records)")
-    scatter_df = A["clustered_data"][["pc1", "pc2", "cluster", "state_ut"]].copy()
+    pc1_col = f"{resource_choice.lower()}_pc1"
+    pc2_col = f"{resource_choice.lower()}_pc2"
+    cluster_col = f"{resource_choice.lower()}_cluster"
+    
+    scatter_df = A["clustered_data"][[pc1_col, pc2_col, cluster_col, "state_ut"]].copy()
+    scatter_df = scatter_df.rename(columns={pc1_col: "pc1", pc2_col: "pc2", cluster_col: "cluster"})
     scatter_df["cluster"] = scatter_df["cluster"].astype(str)
+    
     fig_pca = px.scatter(
         scatter_df, x="pc1", y="pc2", color="cluster",
         hover_data=["state_ut"], opacity=0.5,
@@ -526,9 +548,15 @@ with tab_map:
     ))
     fig_pca.update_layout(height=480)
     st.plotly_chart(fig_pca, use_container_width=True)
+    
+    # Calculate explained variance ratio if visual PCA is available
+    if current_model["pca_viz"] is not None:
+        explained_var = sum(current_model['pca_viz'].explained_variance_ratio_) * 100
+        var_text = f"These 2 components explain {explained_var:.1f}% of total feature variance."
+    else:
+        var_text = ""
     st.caption(
-        "PCA is used only for visualization, not for clustering itself. These 2 components "
-        f"explain {sum(A['pca_viz'].explained_variance_ratio_) * 100:.1f}% of total variance."
+        f"PCA is used only for visualization, not for clustering itself. {var_text}"
     )
  
 # ------------------------------------------------------------------
@@ -569,7 +597,7 @@ with tab_explain:
     )
     st.plotly_chart(fig_conf, use_container_width=True)
  
-    centroid_row = A["centroids_scaled"].loc[predicted_cluster].sort_values(key=abs, ascending=False)
+    centroid_row = current_model["centroids_scaled"].loc[predicted_cluster].sort_values(key=abs, ascending=False)
     top_features = centroid_row.head(8)
     fig_z = go.Figure(go.Bar(
         x=top_features.values, y=top_features.index, orientation="h",
@@ -589,14 +617,15 @@ with tab_explain:
 # ------------------------------------------------------------------
 with tab_compare:
     st.subheader("📈 Cluster Comparison")
-    compare_cols = list(RESOURCE_COLUMNS.values())
-    compare_df = A["cluster_profiles"][compare_cols].reset_index().melt(
-        id_vars="cluster", var_name="Resource", value_name="Average Potential"
+    compare_cols = current_model["feature_cols"]
+    compare_df = current_model["cluster_profiles"][compare_cols].reset_index().melt(
+        id_vars="cluster", var_name="Feature", value_name="Average Value"
     )
-    compare_df["Resource"] = compare_df["Resource"].map({v: k for k, v in RESOURCE_COLUMNS.items()})
+    from cluster_insights import CLIMATE_FEATURE_LABELS
+    compare_df["Feature"] = compare_df["Feature"].map(lambda f: CLIMATE_FEATURE_LABELS.get(f, f.replace("_", " ")).title())
     fig_compare = px.bar(
-        compare_df, x="cluster", y="Average Potential", color="Resource", barmode="group",
-        title="Resource Potential by Cluster (your predicted cluster is outlined)",
+        compare_df, x="cluster", y="Average Value", color="Feature", barmode="group",
+        title=f"{resource_choice} Feature Averages by Cluster (your predicted cluster is outlined)",
     )
     for cl in sorted(compare_df["cluster"].unique()):
         if cl == predicted_cluster:
@@ -605,7 +634,7 @@ with tab_compare:
     st.plotly_chart(fig_compare, use_container_width=True)
  
     st.subheader("Cluster Directory")
-    directory_df = A["insights"][["cluster_name", "recommendation"]].reset_index()
+    directory_df = current_model["insights"][["cluster_name", "recommendation"]].reset_index()
     directory_df.columns = ["Cluster", "Name", "Recommendation"]
     st.dataframe(directory_df, use_container_width=True, hide_index=True)
 
@@ -717,12 +746,21 @@ with tab_scenario:
 
     def _run_scenario(state):
         m = A["clustered_data"][A["clustered_data"]["state_ut"] == state]
-        feats = m[feature_cols].mean()
-        cid, _ = predict_cluster(A["scaler"], A["kmeans"], feature_cols, feats)
+        # Calculate mean across all numeric columns to ensure comparison features exist
+        all_feats = m.select_dtypes(include=[np.number]).mean()
+        # Subset to only the active resource's feature cols for cluster prediction
+        model_feats = all_feats[feature_cols]
+        cid, _ = predict_cluster(
+            current_model["scaler"], 
+            current_model["kmeans"], 
+            current_model["pca"], 
+            feature_cols, 
+            model_feats
+        )
         return {
-            "state": state, "features": feats,
-            "cluster": cid, "cluster_name": A["insights"].loc[cid, "cluster_name"],
-            "recommendation": A["insights"].loc[cid, "recommendation"],
+            "state": state, "features": all_feats,
+            "cluster": cid, "cluster_name": current_model["insights"].loc[cid, "cluster_name"],
+            "recommendation": current_model["insights"].loc[cid, "recommendation"],
         }
 
     scen_a = _run_scenario(scen_a_state)
@@ -787,12 +825,17 @@ with tab_scenario:
 with tab_data:
     st.subheader("📁 Dataset Summary")
     m1, m2, m3 = st.columns(3)
-    m1.metric("Total Records", A["meta"]["n_records"])
-    m2.metric("Number of Features", A["meta"]["n_features"])
-    m3.metric("Number of Clusters", A["meta"]["best_k"])
+    m1.metric("Total Records", len(A["clustered_data"]))
+    m2.metric("Number of Features", len(feature_cols))
+    m3.metric("Number of Clusters", current_model["best_k"])
  
     st.subheader("⬇️ Download Clustered Dataset")
-    csv_bytes = A["clustered_data"].drop(columns=["pc1", "pc2"]).to_csv(index=False).encode("utf-8")
+    # Drop pre-computed visualization coordinates before download
+    cols_to_drop = [
+        "solar_pc1", "solar_pc2", "wind_pc1", "wind_pc2",
+        "hydro_pc1", "hydro_pc2", "biomass_pc1", "biomass_pc2"
+    ]
+    csv_bytes = A["clustered_data"].drop(columns=cols_to_drop, errors="ignore").to_csv(index=False).encode("utf-8")
     st.download_button(
         "Download Full Clustered Dataset (CSV)",
         data=csv_bytes,

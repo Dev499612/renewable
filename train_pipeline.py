@@ -148,38 +148,196 @@ def clean_data(df_original: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------
 # STEP 4 (reproduced) - FEATURE ENGINEERING + SCALING
 # --------------------------------------------------------------------------
-def build_features(df_clean: pd.DataFrame):
-    id_cols = ["state_ut", "year", "month", "latitude", "longitude"]
-    clustering_features = [c for c in df_clean.columns if c not in id_cols]
-
-    X = df_clean[clustering_features].copy()
-    scaler = StandardScaler()
-    X_scaled_array = scaler.fit_transform(X)
-    X_scaled = pd.DataFrame(X_scaled_array, columns=clustering_features, index=X.index)
-
-    return X_scaled, clustering_features, scaler
-
-
 # --------------------------------------------------------------------------
-# STEP 5 (reproduced) - K-MEANS CLUSTERING (K chosen by silhouette score)
+# STEP 4 - MULTI-MODEL FEATURE SELECTION, SCALING, PCA, AND TRAINING
 # --------------------------------------------------------------------------
-def fit_kmeans(X_scaled: pd.DataFrame, k_range=range(2, 11)):
+
+# Suggested features for each model as requested by the user
+RESOURCE_FEATURES = {
+    "solar": [
+        "Solar", "DNI", "GHI", "GTI", 
+        "ClearSky_DNI", "ClearSky_GHI", "Cloud_Opacity", 
+        "Relative_Humidity", "Air_Temperature", "Precipitation_Rate"
+    ],
+    "wind": [
+        "Wind", "Wind_Speed_100m", "Surface_Pressure", "Air_Temperature"
+    ],
+    "hydro": [
+        "Hydro", "Precipitation_Rate", "Relative_Humidity", "Surface_Pressure"
+    ],
+    "biomass": [
+        "Biomass", "Relative_Humidity", "Air_Temperature", "Precipitation_Rate"
+    ]
+}
+
+def map_features(suggested_features: list, actual_cols: list) -> list:
+    """
+    Automatically maps suggested features to the closest column names in the dataset.
+    Handles case mismatches and missing columns using fuzzy string matching.
+    """
+    import difflib
+    mapped = []
+    for feat in suggested_features:
+        # 1. Look for case-insensitive exact match
+        found = False
+        for col in actual_cols:
+            if col.lower() == feat.lower():
+                mapped.append(col)
+                found = True
+                break
+        if found:
+            continue
+        
+        # 2. Fallback to fuzzy match if no exact match is found
+        matches = difflib.get_close_matches(feat, actual_cols, n=1, cutoff=0.3)
+        if matches:
+            mapped.append(matches[0])
+            
+    # Remove any potential duplicates while preserving original order
+    seen = set()
+    return [x for x in mapped if not (x in seen or seen.add(x))]
+
+
+def fit_kmeans_optimal_k(X_transformed: pd.DataFrame, k_range=range(2, 11)):
+    """
+    Calculates K-Means clustering across a range of K.
+    Tracks both inertia (Elbow Method) and Silhouette Scores.
+    Automatically chooses the optimal K based on the maximum Silhouette Score.
+    """
     results = []
-    for k in k_range:
+    # Safeguard against dataset containing fewer rows than maximum K
+    max_k = min(len(X_transformed) - 1, 10)
+    actual_range = range(2, max_k + 1)
+    
+    for k in actual_range:
         model = KMeans(n_clusters=k, random_state=42, n_init=10)
-        labels = model.fit_predict(X_scaled)
+        labels = model.fit_predict(X_transformed)
+        sil = silhouette_score(X_transformed, labels)
         results.append({
             "k": k,
             "inertia": model.inertia_,
-            "silhouette_score": silhouette_score(X_scaled, labels),
+            "silhouette_score": sil,
         })
+        
     results_df = pd.DataFrame(results)
     best_k = int(results_df.loc[results_df["silhouette_score"].idxmax(), "k"])
+    return best_k, results_df
 
+
+def train_resource_model(df_clean: pd.DataFrame, resource: str, suggested_features: list):
+    """
+    Trains a completely separate machine learning pipeline for a single renewable resource.
+    - Separate feature selection & mapping
+    - Separate StandardScaler
+    - Separate PCA (only if it reduces dimensionality while retaining >=95% variance)
+    - Separate optimal K-Means clustering
+    - Separate cluster profiles and standardized centroids
+    - Separate 2D visualization PCA for the dashboard plotting
+    """
+    print(f"\n==================================================")
+    print(f" TRAINING MODEL FOR RESOURCE: {resource.upper()} ")
+    print(f"==================================================")
+    
+    # 1. Feature selection & mapping
+    actual_cols = df_clean.columns.tolist()
+    # Exclude ID columns to avoid clustering on state names, month, or location coordinates
+    id_cols = ["state_ut", "year", "month", "latitude", "longitude"]
+    candidate_cols = [c for c in actual_cols if c not in id_cols]
+    
+    feature_cols = map_features(suggested_features, candidate_cols)
+    print(f"Suggested Features: {suggested_features}")
+    print(f"Mapped Features in Dataset: {feature_cols}")
+    
+    # Extract features subset
+    X = df_clean[feature_cols].copy()
+    
+    # 2. Separate StandardScaler
+    scaler = StandardScaler()
+    X_scaled_array = scaler.fit_transform(X)
+    X_scaled = pd.DataFrame(X_scaled_array, columns=feature_cols, index=X.index)
+    
+    # 3. Separate PCA Variance Check
+    # Check whether PCA is actually useful. If PCA preserves >=95% variance while
+    # reducing dimensionality, use it. Otherwise, skip it.
+    D = len(feature_cols)
+    pca = None
+    use_pca = False
+    X_for_clustering = X_scaled.copy()
+    
+    if D > 1:
+        pca_check = PCA(random_state=42)
+        pca_check.fit(X_scaled)
+        cumulative_variance = np.cumsum(pca_check.explained_variance_ratio_)
+        # Find minimum components needed to capture >= 95% variance
+        n_comp_needed = int(np.argmax(cumulative_variance >= 0.95) + 1)
+        
+        if n_comp_needed < D:
+            # PCA is useful as it reduces dimensionality
+            print(f"PCA status: USE. Dimensionality reduced from {D} to {n_comp_needed} (captures 95% variance)")
+            pca = PCA(n_components=n_comp_needed, random_state=42)
+            X_transformed = pca.fit_transform(X_scaled)
+            X_for_clustering = pd.DataFrame(
+                X_transformed,
+                columns=[f"pc{i+1}" for i in range(n_comp_needed)],
+                index=X.index
+            )
+            use_pca = True
+        else:
+            print(f"PCA status: SKIP. Dimensionality reduction not possible: {n_comp_needed} of {D} components needed to capture 95% variance.")
+    else:
+        print("PCA status: SKIP. Model contains only 1 feature, cannot reduce dimensionality.")
+        
+    # 4. Determine K and Train KMeans
+    best_k, k_search_results = fit_kmeans_optimal_k(X_for_clustering)
+    print(f"Selected Optimal K: {best_k}")
+    
     kmeans_final = KMeans(n_clusters=best_k, random_state=42, n_init=10)
-    labels_final = kmeans_final.fit_predict(X_scaled)
-
-    return kmeans_final, labels_final, best_k, results_df
+    cluster_labels = kmeans_final.fit_predict(X_for_clustering)
+    
+    # 5. Fit a 2D PCA purely for visualization (not used for clustering)
+    pca_viz = None
+    if D >= 2:
+        pca_viz = PCA(n_components=2, random_state=42)
+        pca_viz.fit(X_scaled)
+        
+    # 6. Cluster profiles: average of each feature in original units
+    df_with_labels = df_clean.copy()
+    df_with_labels["cluster"] = cluster_labels
+    cluster_profiles = df_with_labels.groupby("cluster")[feature_cols].mean()
+    
+    # 7. Cluster centroids in standardized space (mean of standardized features)
+    X_scaled_with_labels = X_scaled.copy()
+    X_scaled_with_labels["cluster"] = cluster_labels
+    centroids_scaled = X_scaled_with_labels.groupby("cluster").mean()
+    
+    # 8. Save artifacts to models/<resource>/
+    resource_dir = os.path.join(ROOT_DIR, "models", resource)
+    os.makedirs(resource_dir, exist_ok=True)
+    
+    joblib.dump(scaler, os.path.join(resource_dir, "scaler.joblib"))
+    joblib.dump(kmeans_final, os.path.join(resource_dir, "kmeans.joblib"))
+    if pca is not None:
+        joblib.dump(pca, os.path.join(resource_dir, "pca.joblib"))
+    if pca_viz is not None:
+        joblib.dump(pca_viz, os.path.join(resource_dir, "pca_viz.joblib"))
+        
+    cluster_profiles.to_csv(os.path.join(resource_dir, "cluster_profile.csv"))
+    centroids_scaled.to_csv(os.path.join(resource_dir, "cluster_centroids_scaled.csv"))
+    k_search_results.to_csv(os.path.join(resource_dir, "k_selection_results.csv"), index=False)
+    
+    # Write metadata json
+    meta = {
+        "resource": resource,
+        "feature_cols": feature_cols,
+        "use_pca": use_pca,
+        "pca_components": int(pca.n_components_) if pca is not None else 0,
+        "best_k": best_k,
+    }
+    with open(os.path.join(resource_dir, "metadata.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+        
+    print(f"Successfully trained and saved all {resource.upper()} artifacts to '{resource_dir}'.")
+    return cluster_labels
 
 
 def resolve_raw_data_path():
@@ -228,58 +386,35 @@ def main():
     print("Cleaning data (Step 2 logic) ...")
     df_clean = clean_data(df_original)
 
-    print("Building features + scaling (Step 4 logic) ...")
-    X_scaled, feature_cols, scaler = build_features(df_clean)
+    # Dictionary to collect predictions from each model
+    resource_predictions = {}
 
-    print("Selecting K and training final K-Means model (Step 5 logic) ...")
-    kmeans_final, cluster_labels, best_k, k_search_results = fit_kmeans(X_scaled)
-    print(f"Best K selected: {best_k}")
+    # Train each model independently
+    for resource, suggested_features in RESOURCE_FEATURES.items():
+        cluster_labels = train_resource_model(df_clean, resource, suggested_features)
+        resource_predictions[f"{resource}_cluster"] = cluster_labels
 
-    # Attach cluster labels to both scaled and original-unit data
-    X_scaled["cluster"] = cluster_labels
-    df_clean["cluster"] = cluster_labels
+    # Add all resource clustering labels to the cleaned dataset
+    df_clustered = df_clean.copy()
+    for col_name, labels in resource_predictions.items():
+        df_clustered[col_name] = labels
 
-    # Fit a 2D PCA purely for visualization (not used for clustering itself,
-    # exactly as in the notebook)
-    pca_viz = PCA(n_components=2)
-    pca_viz.fit(X_scaled[feature_cols])
-
-    # Cluster profiles: average of each feature, in real (original) units
-    cluster_profiles = df_clean.groupby("cluster")[feature_cols].mean()
-
-    # Cluster centroids in STANDARDIZED space. Because features were scaled
-    # with the global mean/std, each centroid value here IS the z-score of
-    # that cluster's average relative to the overall dataset average.
-    # The dashboard uses these z-scores (not manual rules) to describe and
-    # name clusters automatically.
-    centroids_scaled = pd.DataFrame(kmeans_final.cluster_centers_, columns=feature_cols)
-    centroids_scaled.index.name = "cluster"
-
-    # --------------------------------------------------------------------
-    # SAVE ARTIFACTS
-    # --------------------------------------------------------------------
-    joblib.dump(scaler, f"{ARTIFACTS_DIR}/standard_scaler.joblib")
-    joblib.dump(kmeans_final, f"{ARTIFACTS_DIR}/kmeans_model.joblib")
-    joblib.dump(pca_viz, f"{ARTIFACTS_DIR}/pca_viz.joblib")
-
-    with open(f"{ARTIFACTS_DIR}/feature_columns.json", "w") as f:
-        json.dump(feature_cols, f, indent=2)
-
-    cluster_profiles.to_csv(f"{ARTIFACTS_DIR}/cluster_profiles.csv")
-    centroids_scaled.to_csv(f"{ARTIFACTS_DIR}/cluster_centroids_scaled.csv")
-    df_clean.to_csv(f"{ARTIFACTS_DIR}/clustered_dataset.csv", index=False)
-    k_search_results.to_csv(f"{ARTIFACTS_DIR}/k_selection_results.csv", index=False)
-
-    with open(f"{ARTIFACTS_DIR}/meta.json", "w") as f:
+    # Save the global clustered dataset in the models/ folder
+    models_dir = os.path.join(ROOT_DIR, "models")
+    os.makedirs(models_dir, exist_ok=True)
+    df_clustered.to_csv(os.path.join(models_dir, "clustered_dataset.csv"), index=False)
+    
+    # Save a generic meta file in models/ for high-level record counting
+    with open(os.path.join(models_dir, "meta.json"), "w") as f:
         json.dump({
-            "best_k": best_k,
             "n_records": int(len(df_clean)),
-            "n_features": len(feature_cols),
+            "resources": list(RESOURCE_FEATURES.keys())
         }, f, indent=2)
 
-    print(f"\nAll artifacts saved to '{ARTIFACTS_DIR}/'. You can now run the dashboard:")
-    print("    streamlit run app.py")
+    print(f"\nAll 4 resource models successfully trained! Outputs organized under '{models_dir}/'.")
+    print("Run the dashboard using: streamlit run app.py")
 
 
 if __name__ == "__main__":
     main()
+

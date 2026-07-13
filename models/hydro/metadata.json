@@ -1,0 +1,12 @@
+{
+  "resource": "hydro",
+  "feature_cols": [
+    "hydro",
+    "precipitation_rate",
+    "relative_humidity",
+    "surface_pressure"
+  ],
+  "use_pca": false,
+  "pca_components": 0,
+  "best_k": 8
+}

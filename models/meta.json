@@ -1,0 +1,9 @@
+{
+  "n_records": 1859,
+  "resources": [
+    "solar",
+    "wind",
+    "hydro",
+    "biomass"
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "resource": "solar",
+  "feature_cols": [
+    "solar",
+    "dni",
+    "ghi",
+    "gti",
+    "clearsky_dni",
+    "clearsky_gti",
+    "cloud_opacity",
+    "relative_humidity",
+    "air_temp",
+    "precipitation_rate"
+  ],
+  "use_pca": true,
+  "pca_components": 6,
+  "best_k": 4
+}

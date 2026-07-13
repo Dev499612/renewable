@@ -1,0 +1,12 @@
+{
+  "resource": "biomass",
+  "feature_cols": [
+    "biomass",
+    "relative_humidity",
+    "air_temp",
+    "precipitation_rate"
+  ],
+  "use_pca": false,
+  "pca_components": 0,
+  "best_k": 4
+}

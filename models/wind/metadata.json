@@ -1,0 +1,12 @@
+{
+  "resource": "wind",
+  "feature_cols": [
+    "wind",
+    "wind_speed_100m",
+    "surface_pressure",
+    "air_temp"
+  ],
+  "use_pca": false,
+  "pca_components": 0,
+  "best_k": 2
+}
